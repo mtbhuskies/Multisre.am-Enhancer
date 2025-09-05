@@ -1,0 +1,194 @@
+// ==UserScript==
+// @name         multistre.am: Rotate->BOTH + Autoplay + 'r' + Source + True Chat Collapse
+// @namespace    mtbhuskies
+// @version      2.4.0
+// @description  Rotate->BOTH on main; autoplay nudge; 'r' hotkey; force Source; collapse chat column and widen main tile.
+// @match        https://multistre.am/*
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  // --- feature toggles
+  const ENABLE_AUTOPLAY_NUDGE = true;
+  const ENABLE_FORCE_SOURCE   = true;
+
+  // --- helpers
+  const q  = (s, r=document) => r.querySelector(s);
+  const qa = (s, r=document) => Array.from(r.querySelectorAll(s));
+  const visible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+  };
+
+  // Largest on-screen streamcontainer
+  function largestStreamEl() {
+    const list = qa('#layoutwrapper .streamcontainer[data-object-type="stream"][data-index]').filter(visible);
+    if (!list.length) return null;
+    list.sort((a,b) => {
+      const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect();
+      return (rb.width*rb.height)-(ra.width*ra.height);
+    });
+    return list[0];
+  }
+
+  function clickBothByIndex(idx) {
+    const overlay = q(`.streamoverlay[data-index="${idx}"]`);
+    if (!overlay) return false;
+    const both  = overlay.querySelector('.mainbuttons .bothbutton');
+    if (both)  { both.click(); return true; }
+    const audio = overlay.querySelector('.mainbuttons .audiobutton');
+    if (audio) { audio.click(); return true; }
+    return false;
+  }
+
+  function applyAfterRotate() {
+    [180, 400].forEach(ms => setTimeout(() => {
+      const el = largestStreamEl();
+      if (!el) return;
+      clickBothByIndex(el.getAttribute('data-index'));
+    }, ms));
+  }
+
+  // --- Rotate button hook
+  document.addEventListener('click', (ev) => {
+    const rot = ev.target?.closest?.('a.rotate.sidebar-button');
+    if (!rot) return;
+    applyAfterRotate();
+  }, true);
+
+  // --- Hotkey: 'r' = Rotate -> Both
+  function isTypingTarget(t) {
+    return t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+  }
+  let unlocked = false;
+  window.addEventListener('keydown', (e) => {
+    if (isTypingTarget(e.target)) return;
+    if (e.key.toLowerCase() !== 'r') return;
+    q('a.rotate.sidebar-button')?.click();
+    applyAfterRotate();
+    unlocked = true; // counts as gesture for autoplay
+  }, true);
+
+  // --- Autoplay nudge (first user gesture)
+  function nudgeAutoplay() {
+    if (!ENABLE_AUTOPLAY_NUDGE || unlocked) return;
+    unlocked = true;
+    const el = largestStreamEl();
+    if (el) {
+      clickBothByIndex(el.getAttribute('data-index'));
+      try {
+        const tag = el.getAttribute('data-tag');
+        const p = tag && window.player_objs && window.player_objs[tag];
+        p?.play?.(); p?.setMuted?.(false);
+      } catch {}
+    }
+  }
+  window.addEventListener('pointerdown', nudgeAutoplay, { once:true, capture:true });
+  window.addEventListener('keydown',     nudgeAutoplay, { once:true, capture:true });
+
+  // --- Force quality = Source ('chunked'), else best
+  function players() { return window.player_objs || {}; }
+  function setSourceOrBest(p) {
+    try { p.setQuality?.('chunked'); } catch {}
+    try {
+      const qs = p.getQualities?.();
+      if (!qs || !qs.length) return;
+      const names = qs.map(q => (q?.name ?? q?.group ?? q?.quality ?? q?.label)).filter(Boolean);
+      const pref = ['chunked','1080p60','1080p','720p60','720p','480p','360p','160p','auto'];
+      const pick = pref.find(n => names.includes(n)) || names[0];
+      if (pick) p.setQuality?.(pick);
+    } catch {}
+  }
+  function enforceQualityAll() {
+    if (!ENABLE_FORCE_SOURCE) return;
+    Object.values(players()).forEach(setSourceOrBest);
+  }
+  function wireQualityEvents() {
+    if (!ENABLE_FORCE_SOURCE) return;
+    Object.values(players()).forEach(p => {
+      try {
+        p.addEventListener?.(Twitch.Player.READY,   () => setTimeout(() => setSourceOrBest(p), 50));
+        p.addEventListener?.(Twitch.Player.PLAYING, () => setTimeout(() => setSourceOrBest(p), 50));
+      } catch {}
+    });
+  }
+
+  // --- TRUE CHAT COLLAPSE: hide chat column + widen main tile (data-index="0") to 100%
+  function injectCollapseCSS() {
+    if (q('#ms-chat-collapse-fw-style')) return;
+    const st = document.createElement('style');
+    st.id = 'ms-chat-collapse-fw-style';
+    st.textContent = `
+      /* hide chat panes entirely */
+      html.ms-chat-collapsed-fw #layoutwrapper .chatcontainer { display:none !important; visibility:hidden !important; }
+      html.ms-chat-collapsed-fw #layoutwrapper .streamoverlay .hidden-when-no-chat { display:none !important; }
+
+      /* expand main (index 0) to full width in ANY layout */
+      html.ms-chat-collapsed-fw #layoutwrapper .streamcontainer[data-index="0"],
+      html.ms-chat-collapsed-fw #layoutwrapper .streamoverlay[data-index="0"] {
+        width: 100% !important;
+        left: 0% !important;
+      }
+    `;
+    document.head.appendChild(st);
+  }
+
+  function chatIsCollapsed() {
+    return document.documentElement.classList.contains('ms-chat-collapsed-fw');
+  }
+  function collapseChat() {
+    injectCollapseCSS();
+    document.documentElement.classList.add('ms-chat-collapsed-fw');
+    updateChatToggleUI();
+    // keep audio/chat synced to the now-wider main tile
+    applyAfterRotate();
+  }
+  function expandChat() {
+    document.documentElement.classList.remove('ms-chat-collapsed-fw');
+    updateChatToggleUI();
+    // re-align audio/chat in case layout reflows
+    applyAfterRotate();
+  }
+
+  // --- UI: floating toggle button
+  function ensureChatToggleUI() {
+    if (q('#ms-chat-toggle')) return;
+    const btn = document.createElement('button');
+    btn.id = 'ms-chat-toggle';
+    btn.textContent = 'Hide Chat';
+    Object.assign(btn.style, {
+      position:'fixed', right:'12px', top:'72px', zIndex:'9999',
+      padding:'6px 10px', border:'1px solid #888', borderRadius:'4px',
+      background:'#1f1f1f', color:'#eee', font:'12px/1.2 sans-serif',
+      cursor:'pointer', opacity:'0.9'
+    });
+    btn.addEventListener('mouseenter', () => btn.style.opacity = '1');
+    btn.addEventListener('mouseleave', () => btn.style.opacity = '0.9');
+    btn.addEventListener('click', () => { chatIsCollapsed() ? expandChat() : collapseChat(); });
+    document.body.appendChild(btn);
+    updateChatToggleUI();
+  }
+  function updateChatToggleUI() {
+    const btn = q('#ms-chat-toggle');
+    if (!btn) return;
+    btn.textContent = chatIsCollapsed() ? 'Show Chat' : 'Hide Chat';
+  }
+
+  // --- init
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      // Initial align
+      const el = largestStreamEl();
+      if (el) clickBothByIndex(el.getAttribute('data-index'));
+      wireQualityEvents();
+      enforceQualityAll();
+      setTimeout(enforceQualityAll, 1500);
+    }, 600);
+
+    ensureChatToggleUI();
+  });
+})();
+
